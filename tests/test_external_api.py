@@ -134,3 +134,30 @@ class TestSearchByName(unittest.TestCase):
     def test_network_failure_raises(self, _):
         with self.assertRaises(ExternalAPIError):
             search_products_by_name("milk")
+            
+class TestSearchFallback(unittest.TestCase):
+    @patch("app.external_api.requests.get")
+    def test_falls_back_to_new_search_when_classic_fails(self, mock_get):
+        mock_get.side_effect = [
+            fake_response(503),
+            fake_response(200, {"hits": [{"code": "111", "product_name": "Peanut Butter",
+                                          "brands": ["Skippy", " "]}]}),
+        ]
+        products = search_products_by_name("peanut butter")
+
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(mock_get.call_args.args[0], "https://search.openfoodfacts.org/search")
+        self.assertEqual(products[0]["brands"], "Skippy")
+        self.assertEqual(products[0]["barcode"], "111")
+
+    @patch("app.external_api.requests.get")
+    def test_no_fallback_when_classic_succeeds(self, mock_get):
+        mock_get.return_value = fake_response(200, {"products": [RAW_PRODUCT]})
+        search_products_by_name("nutella")
+        self.assertEqual(mock_get.call_count, 1)
+
+    @patch("app.external_api.requests.get")
+    def test_both_services_down_raises(self, mock_get):
+        mock_get.side_effect = [fake_response(503), requests.ConnectionError("offline")]
+        with self.assertRaises(ExternalAPIError):
+            search_products_by_name("milk")    
