@@ -15,6 +15,11 @@ Misc:
 from flask import Blueprint, jsonify, request
 
 from app import data
+from app.external_api import (
+    ExternalAPIError,
+    fetch_product_by_barcode,
+    search_products_by_name,
+)
 
 bp = Blueprint("inventory", __name__)
 
@@ -169,7 +174,99 @@ def delete_item(item_id):
     data.inventory.remove(item)
     return jsonify({"message": f"Item {item_id} deleted.", "item": item}), 200
 
+# --------------------------------------------------------------------------- #
+# OpenFoodFacts helper routes
+# --------------------------------------------------------------------------- #
+@bp.get("/external/barcode/<barcode>")
+def external_by_barcode(barcode):
+    """Look a product up on OpenFoodFacts without saving it."""
+    try:
+        product = fetch_product_by_barcode(barcode)
+    except ValueError as exc:
+        return error(str(exc), 400)
+    except ExternalAPIError as exc:
+        return error(str(exc), 502)
+    if product is None:
+        return error(f"No product found on OpenFoodFacts for barcode {barcode}.", 404)
+    return jsonify(product), 200
 
+
+@bp.get("/external/search")
+def external_search():
+    """Search OpenFoodFacts by name without saving anything."""
+    try:
+        products = search_products_by_name(request.args.get("name", ""))
+    except ValueError as exc:
+        return error(str(exc), 400)
+    except ExternalAPIError as exc:
+        return error(str(exc), 502)
+    return jsonify(products), 200
+
+
+@bp.post("/inventory/import")
+def import_item():
+    """
+    Fetch a product from OpenFoodFacts by barcode and add it to the inventory.
+
+    Body: {"barcode": "...", "price": 2.5, "stock": 10}
+    """
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or not body.get("barcode"):
+        return error("barcode is required.", 400)
+
+    barcode = str(body["barcode"]).strip()
+    if any(i["barcode"] == barcode for i in data.inventory):
+        return error(f"An item with barcode {barcode} already exists.", 409)
+
+    try:
+        price = parse_price(body.get("price", 0))
+        stock = parse_stock(body.get("stock", 0))
+    except (TypeError, ValueError) as exc:
+        return error(f"Invalid value: {exc}.", 400)
+
+    try:
+        product = fetch_product_by_barcode(barcode)
+    except ValueError as exc:
+        return error(str(exc), 400)
+    except ExternalAPIError as exc:
+        return error(str(exc), 502)
+    if product is None:
+        return error(f"No product found on OpenFoodFacts for barcode {barcode}.", 404)
+    if not product["product_name"]:
+        product["product_name"] = f"Product {barcode}"
+
+    item = new_item({**product, "price": price, "stock": stock})
+    data.inventory.append(item)
+    return jsonify(item), 201
+
+
+@bp.post("/inventory/<int:item_id>/enrich")
+def enrich_item(item_id):
+    """
+    Fill in an existing item's empty fields from OpenFoodFacts using its
+    barcode. Price and stock are never touched.
+    """
+    item = data.find_item(item_id)
+    if item is None:
+        return error(f"Item {item_id} not found.", 404)
+    if not item.get("barcode"):
+        return error("Item has no barcode to look up.", 400)
+
+    try:
+        product = fetch_product_by_barcode(item["barcode"])
+    except ValueError as exc:
+        return error(str(exc), 400)
+    except ExternalAPIError as exc:
+        return error(str(exc), 502)
+    if product is None:
+        return error(f"No product found on OpenFoodFacts for barcode {item['barcode']}.", 404)
+
+    updated = []
+    for field, value in product.items():
+        if value and not item.get(field):
+            item[field] = value
+            updated.append(field)
+    return jsonify({"item": item, "updated_fields": updated}), 200
 @bp.get("/health")
 def health():
     return jsonify({"status": "ok", "items": len(data.inventory)}), 200
